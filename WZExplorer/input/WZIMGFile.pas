@@ -1,0 +1,445 @@
+unit WZIMGFile;
+
+interface
+
+uses Windows, Classes, Types, SysUtils, Generics.Collections, Tools,
+     WZReader, WZDirectory, PNGMapleCanvas, MP3MapleSound;
+
+type
+  tagVARENUM = (VT_EMPTY, VT_NULL, VT_I2, VT_I4, VT_R4, VT_R8, VT_CY, VT_DATE, VT_BSTR,
+                VT_DISPATCH, VT_ERROR, VT_BOOL, VT_VARIANT, VT_UNKNOWN, VT_DECIMAL, VT_UNDEFINED0xF,
+                VT_I1, VT_UI1, VT_UI2, VT_UI4, VT_I8, VT_UI8);
+
+  TMapleDataType = (mdtNone, mdtIMG_0x00, mdtShort, mdtInt, mdtFloat, mdtDouble,
+                    mdtString, mdtExtended, mdtProperty, mdtCanvas, mdtVector,
+                    mdtConvex, mdtSound, mdtUOL, mdtInt64);
+
+  TWZIMGEntry = class(TWZEntry)
+  private
+    FType: TMapleDataType;
+    FVT: tagVARENUM;
+    FData: UInt64;
+    FCanvas: TPNGMapleCanvas;
+    FVector: TPoint;
+    FSound: TMP3MapleSound;
+
+    FChildren: TObjectList<TWZIMGEntry>;
+
+    function GetChild(const Name: string): TWZIMGEntry;
+  public
+    constructor Create(AParent: TWZEntry);
+    destructor Destroy; override;
+
+    procedure AddChild(Entry: TWZIMGEntry);
+    procedure Finish;
+
+    function Get(const Path: string): TWZIMGEntry; overload;
+    function Get(const Path: string; Default: Integer): Integer; overload;
+    function Get64(const Path: string; const Default: Int64): Int64;
+    function Get(const Path: string; Default: Double): Double; overload;
+    function Get(const Path, Default: string): string; overload;
+
+    property DataType: TMapleDataType read FType write FType;
+    property VT: tagVARENUM read FVT write FVT;
+    property Data: UInt64 read FData write FData;
+    property Canvas: TPNGMapleCanvas read FCanvas write FCanvas;
+    property Vector: TPoint read FVector write FVector;
+    property Sound: TMP3MapleSound read FSound write FSound;
+    property Child[const Name: string]: TWZIMGEntry read GetChild;
+    property Children: TObjectList<TWZIMGEntry> read FChildren;  // read-only
+  end;
+
+  TWZIMGFile = class
+  private
+    WZ: TWZReader;
+    FFileEntry: TWZFile;
+    FRoot: TWZIMGEntry;
+
+    procedure Parse(Entry: TWZIMGEntry);
+    procedure ParseExtended(Entry: TWZIMGEntry; EndOfExtendedBlock: Cardinal);
+  public
+    constructor Create(AReader: TWZReader; AFileEntry: TWZFile);
+    destructor Destroy; override;
+
+    property Root: TWZIMGEntry read FRoot write FRoot;
+  end;
+
+function LoadStandalone(const FileName: string): TWZIMGFile;
+
+implementation
+
+function MakePChar(const S: string): NativeUInt;
+var
+  P: PChar;
+begin
+  P := StrAlloc(Length(S) + 1);
+  StrPCopy(P, S);
+  Result := NativeUInt(P);
+end;
+
+{ TWZIMGEntry }
+
+constructor TWZIMGEntry.Create(AParent: TWZEntry);
+begin
+  FParent := AParent;
+  FChildren := TObjectList<TWZIMGEntry>.Create;
+end;
+
+destructor TWZIMGEntry.Destroy;
+begin
+  FChildren.Free;
+
+  if FSound <> nil then
+    FSound.Free;
+
+  if FCanvas <> nil then
+    FCanvas.Free;
+
+  if FType in [mdtString, mdtUOL] then
+    StrDispose(PChar(FData));
+
+  inherited;
+end;
+
+procedure TWZIMGEntry.AddChild(Entry: TWZIMGEntry);
+begin
+  FChildren.Add(Entry);
+end;
+
+procedure TWZIMGEntry.Finish;
+begin
+  FChildren.TrimExcess;
+end;
+
+function TWZIMGEntry.Get(const Path: string): TWZIMGEntry;
+var
+  Split: TStringArray;
+  i: Integer;
+begin
+  Split := Explode('/', Path);
+
+  Result := Self;
+  for i := 0 to High(Split) do
+  begin
+    if Split[i] = '..' then
+      Result := TWZIMGEntry(Result.Parent)
+    else
+      Result := Result.Child[Split[i]];
+
+    if not Assigned(Result) then
+      Exit;
+  end;
+
+  Split := nil;
+end;
+
+function TWZIMGEntry.Get(const Path: string; Default: Integer): Integer;
+var
+  E: TWZIMGEntry;
+begin
+  E := Get(Path);
+  if E = nil then
+    Exit(Default);
+
+  if not (E.DataType in [mdtShort, mdtInt]) then
+  begin
+    if E.DataType = mdtString then
+    begin
+      if TryStrToInt(PChar(E.Data), Result) then
+        Exit;
+    end
+    else if E.DataType = mdtFloat then
+      Exit(Trunc(PSingle(@E.Data)^))
+    else if E.DataType = mdtDouble then
+      Exit(Trunc(PDouble(@E.Data)^));
+
+    raise Exception.Create(Path + ' is not an integer.');
+  end;
+
+  Result := E.Data;
+end;
+
+function TWZIMGEntry.Get64(const Path: string; const Default: Int64): Int64;
+var
+  E: TWZIMGEntry;
+begin
+  E := Get(Path);
+  if E = nil then
+    Exit(Default);
+
+  if not (E.DataType in [mdtShort, mdtInt, mdtInt64]) then
+  begin
+    if E.DataType = mdtString then
+    begin
+      if TryStrToInt64(PChar(E.Data), Result) then
+        Exit;
+    end
+    else if E.DataType = mdtFloat then
+      Exit(Trunc(PSingle(@E.Data)^))
+    else if E.DataType = mdtDouble then
+      Exit(Trunc(PDouble(@E.Data)^));
+
+    raise Exception.Create(Path + ' is not an int64.');
+  end;
+
+  Result := E.Data;
+end;
+
+function TWZIMGEntry.Get(const Path: string; Default: Double): Double;
+var
+  E: TWZIMGEntry;
+begin
+  E := Get(Path);
+  if E = nil then
+    Exit(Default);
+
+  case E.DataType of
+    mdtShort, mdtInt, mdtInt64: Result := E.Data;
+    mdtFloat: Result := PSingle(@E.Data)^;
+    mdtDouble: Result := PDouble(@E.Data)^;
+    //mdtString: Result := StrToFloat(PChar(E.Data));
+    else raise Exception.Create(Path + ' is not a double');
+  end;
+end;
+
+function TWZIMGEntry.GetChild(const Name: string): TWZIMGEntry;
+begin
+  for Result in FChildren do
+    if SameText(Result.Name, Name) then
+      Exit;
+
+  Result := nil;
+end;
+
+function TWZIMGEntry.Get(const Path, Default: string): string;
+var
+  E: TWZIMGEntry;
+begin
+  E := Get(Path);
+  if E = nil then
+    Exit(Default);
+
+  if not (E.DataType in [mdtString, mdtUOL]) then
+  begin
+    if E.DataType in [mdtShort, mdtInt, mdtInt64] then
+      Exit(IntToStr(E.Data));
+
+    raise Exception.Create(Path + ' is not a string.');
+  end;
+
+  Result := PChar(E.Data);
+end;
+
+{ TWZIMGFile }
+
+constructor TWZIMGFile.Create(AReader: TWZReader; AFileEntry: TWZFile);
+begin
+  WZ := AReader;
+  FFileEntry := AFileEntry;
+
+  WZ.Seek(FFileEntry.Offset, soBeginning);
+
+  FRoot := TWZIMGEntry.Create(FFileEntry.Parent);
+  FRoot.Name := FFileEntry.Name;
+  FRoot.DataType := mdtExtended;
+  FRoot.Offset := FFileEntry.Offset;
+
+  ParseExtended(FRoot, 0);
+end;
+
+destructor TWZIMGFile.Destroy;
+begin
+  FFileEntry.IMGFile := nil;
+  FRoot.Free;
+
+  inherited;
+end;
+
+procedure TWZIMGFile.Parse(Entry: TWZIMGEntry);
+var
+  iMarker: Byte;
+  EndOfExtBlock: Cardinal;
+begin
+  iMarker := WZ.ReadByte;
+
+  case iMarker of
+    0: Entry.Name := WZ.ReadDecodedString;
+    1: Entry.Name := WZ.ReadDecodedStringAtOffsetAndReset(FFileEntry.Offset + Cardinal(WZ.ReadInt));
+  end;
+
+  Entry.Offset := WZ.Position;
+  Entry.VT := tagVARENUM(WZ.ReadByte);
+
+  case Entry.VT of
+    VT_EMPTY: Entry.DataType := mdtIMG_0x00;
+    VT_I2, VT_BOOL, VT_UI2:
+    begin
+      Entry.DataType := mdtShort;
+      Entry.Data := WZ.ReadShort;
+    end;
+    VT_I4, VT_UI4:
+    begin
+      Entry.DataType := mdtInt;
+      Entry.Data := WZ.ReadValue;
+    end;
+    VT_R4:
+    begin
+      Entry.DataType := mdtFloat;
+      PSingle(@Entry.Data)^ := WZ.ReadFloatValue;
+    end;
+    VT_R8:
+    begin
+      Entry.DataType := mdtDouble;
+      PDouble(@Entry.Data)^ := WZ.ReadDouble;
+    end;
+    VT_I8, VT_UI8:
+    begin
+      Entry.DataType := mdtInt64;
+      Entry.Data := WZ.ReadValue64;
+    end;
+    VT_BSTR:
+    begin
+      Entry.DataType := mdtString;
+      iMarker := WZ.ReadByte;
+      case iMarker of
+        0: Entry.Data := MakePChar(WZ.ReadDecodedString);
+        1: Entry.Data := MakePChar(WZ.ReadDecodedStringAtOffsetAndReset(Cardinal(WZ.ReadInt) + FFileEntry.Offset));
+        else raise Exception.CreateFmt('Unknown iMarker: %d', [iMarker]);
+      end;
+    end;
+    VT_DISPATCH:
+    begin
+      Entry.DataType := mdtExtended;
+      EndOfExtBlock := WZ.ReadInt;
+      EndOfExtBlock := EndOfExtBlock + WZ.Position;
+      ParseExtended(Entry, EndOfExtBlock);
+    end;
+    else raise Exception.CreateFmt('Unknown VARENUM: %d at offset %d', [Byte(Entry.VT), WZ.Position]);
+  end;
+end;
+
+procedure TWZIMGFile.ParseExtended(Entry: TWZIMGEntry; EndOfExtendedBlock: Cardinal);
+var
+  Marker: Byte;
+  dType: string;
+  Children, i: Integer;
+  ChildEntry: TWZIMGEntry;
+  Width, Height, Format, Format2, DataLength, X, Y: Integer;
+begin
+  Marker := WZ.ReadByte;
+
+  case Marker of
+    $73: dType := WZ.ReadDecodedString;
+    $1B: dType := WZ.ReadDecodedStringAtOffsetAndReset(FFileEntry.Offset + Cardinal(WZ.ReadInt));
+  end;
+
+  if dType = 'Property' then
+  begin
+    Entry.DataType := mdtProperty;
+
+    WZ.ReadByte;
+    WZ.ReadByte;
+    Children := WZ.ReadValue;
+
+    for i := 0 to Children - 1 do
+    begin
+      ChildEntry := TWZIMGEntry.Create(Entry);
+      Parse(ChildEntry);
+      ChildEntry.Finish;
+      Entry.AddChild(ChildEntry);
+    end;
+  end
+  else
+  if dType = 'Canvas' then
+  begin
+    Entry.DataType := mdtCanvas;
+    WZ.ReadByte;   // always 0 (?)
+
+    Marker := WZ.ReadByte;
+    if Marker = 1 then
+    begin
+      WZ.ReadByte;
+      WZ.ReadByte;
+
+      Children := WZ.ReadValue;
+
+      for i := 0 to Children - 1 do
+      begin
+        ChildEntry := TWZIMGEntry.Create(Entry);
+        Parse(ChildEntry);
+        ChildEntry.Finish;
+        Entry.AddChild(ChildEntry);
+      end;
+    end;
+
+    Width := WZ.ReadValue;
+    Height := WZ.ReadValue;
+    Format := WZ.ReadValue;
+    Format2 := WZ.ReadByte;
+    WZ.ReadInt;    // always 0 (?)
+    DataLength := WZ.ReadInt - 1;
+    WZ.ReadByte;   // always 0 (?)
+
+    Entry.Canvas := TPNGMapleCanvas.Create(Width, Height, DataLength, WZ.Position, Format + Format2, WZ);
+    WZ.Seek(DataLength, soCurrent);    // Skip the image
+  end
+  else
+  if dType = 'Shape2D#Vector2D' then
+  begin
+    Entry.DataType := mdtVector;
+    X := WZ.ReadValue;
+    Y := WZ.ReadValue;
+    Entry.Vector := Point(X, Y);
+  end
+  else
+  if dType = 'Shape2D#Convex2D' then
+  begin
+    Children := WZ.ReadValue;
+
+    for i := 0 to Children - 1 do
+    begin
+      ChildEntry := TWZIMGEntry.Create(Entry);
+      ParseExtended(ChildEntry, 0);
+      ChildEntry.Finish;
+      Entry.AddChild(ChildEntry);
+    end;
+  end
+  else
+  if dType = 'Sound_DX8' then
+  begin
+    Entry.DataType := mdtSound;
+    WZ.ReadByte;
+    DataLength := WZ.ReadValue;
+    WZ.ReadValue;  // no clue what this is
+
+    Entry.Sound := TMP3MapleSound.Create(DataLength, WZ.Position, WZ);
+    WZ.Seek(EndOfExtendedBlock, soBeginning);
+  end
+  else
+  if dType = 'UOL' then
+  begin
+    Entry.DataType := mdtUOL;
+    WZ.ReadByte;
+
+    Marker := WZ.ReadByte;
+    case Marker of
+      0: Entry.Data := MakePChar(WZ.ReadDecodedString);
+      1: Entry.Data := MakePChar(WZ.ReadDecodedStringAtOffsetAndReset(FFileEntry.Offset + Cardinal(WZ.ReadInt)));
+      else raise Exception.Create('Unknown UOL Marker');
+    end;
+  end;
+end;
+
+function LoadStandalone(const FileName: string): TWZIMGFile;
+var
+  Reader: TWZReader;
+  F: TWZFile;
+begin
+  Reader := TWZReader.Create(FileName);
+  F := TWZFile.Create(ExtractFileName(Reader.FileName), 0, 0, 0, nil);
+  F.Offset := 0;
+  Result := TWZIMGFile.Create(Reader, F);
+  F.IMGFile := Result;
+end;
+
+end.
